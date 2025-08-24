@@ -5,6 +5,7 @@ on:
     types: [published]
   push:
     branches: [ "main" ]
+    # paths: [ 'Dockerfile', 'requirements.txt', 'ovh_dedicated.py', '.github/workflows/publish.yml' ]  # <- optionnel
   workflow_dispatch:
     inputs:
       tag:
@@ -23,16 +24,13 @@ permissions:
 
 env:
   IMAGE_NAME: ovh-dedicated-cli
-  # Motifs qui déclenchent un push si présents dans le commit message sur main
   PUBLISH_COMMIT_PATTERN: '(\[publish\]|ci:publish|docker:push)'
 
 jobs:
   publish:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Decide if we should push
         id: gate
@@ -49,19 +47,14 @@ jobs:
               should=true
             fi
           fi
-          echo "should=${should}" | tee -a "$GITHUB_OUTPUT"
+          echo "should=${should}" >> "$GITHUB_OUTPUT"
 
       - name: Stop early if not publishing
-        if: steps.gate.outputs.should != 'true'
-        run: |
-          echo "Skipping publish (no release/manual trigger and commit message did not match pattern)."
-          exit 0
+        if: ${{ steps.gate.outputs.should != 'true' }}
+        run: echo "Skipping publish." && exit 0
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
 
       - name: DockerHub login
         if: ${{ steps.gate.outputs.should == 'true' && secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
@@ -71,7 +64,6 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # Et pour être cohérent, ajoute aussi les ${ { } } au step GHCR :
       - name: GHCR login
         if: ${{ steps.gate.outputs.should == 'true' }}
         uses: docker/login-action@v3
@@ -80,18 +72,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Compute extra tags for this event
+      - name: Compute extra tags
         id: tags
         shell: bash
         run: |
-          EXTRA_TAGS=""
+          rel_tag=""
           if [[ "${{ github.event_name }}" == "release" && "${{ github.event.action }}" == "published" ]]; then
-            # Use the release tag name as-is (e.g. v1.2.3)
-            echo "rel_tag=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
+            rel_tag="${{ github.event.release.tag_name }}"
           elif [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.tag }}" != "" ]]; then
-            echo "rel_tag=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+            rel_tag="${{ inputs.tag }}"
           fi
-          # latest conditions: release OR manual with latest=true OR commit-trigger on main
           latest="false"
           if [[ "${{ github.event_name }}" == "release" ]]; then latest="true"; fi
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.latest }}" == "true" ]]; then latest="true"; fi
@@ -101,28 +91,23 @@ jobs:
               latest="true"
             fi
           fi
-          echo "latest=${latest}" >> $GITHUB_OUTPUT
+          echo "rel_tag=${rel_tag}" >> "$GITHUB_OUTPUT"
+          echo "latest=${latest}" >> "$GITHUB_OUTPUT"
 
-      - name: Extract metadata (both registries)
+      - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: |
             docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}
             ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
-          # Base tags (short SHA always)
           tags: |
             type=sha,format=short
-            # Release tag (from release event) or manual input tag
             type=raw,value=${{ steps.tags.outputs.rel_tag }},enable=${{ steps.tags.outputs.rel_tag != '' }}
-            # Latest if flagged
             type=raw,value=latest,enable=${{ steps.tags.outputs.latest == 'true' }}
-          labels: |
-            org.opencontainers.image.title=${{ env.IMAGE_NAME }}
-            org.opencontainers.image.source=${{ github.repository }}
 
       - name: Build and push (multi-arch)
-        if: steps.gate.outputs.should == 'true'
+        if: ${{ steps.gate.outputs.should == 'true' }}
         uses: docker/build-push-action@v6
         with:
           context: .
