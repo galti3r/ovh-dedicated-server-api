@@ -2,10 +2,10 @@ name: Publish Docker image
 
 on:
   release:
-    types: [published]
+    types: [published]        # 1) quand tu cliques "Publish release" (pas draft)
   push:
-    branches: [ "main" ]
-  workflow_dispatch:
+    branches: [ "main" ]      # 3) push/merge sur main
+  workflow_dispatch:          # 2) déclenchement manuel
     inputs:
       tag:
         description: "Tag to publish (e.g. v1.2.3). Leave empty to publish latest+sha only."
@@ -23,39 +23,44 @@ permissions:
 
 env:
   IMAGE_NAME: ovh-dedicated-cli
+  # motifs acceptés dans le message de commit pour publier sur push main
   PUBLISH_COMMIT_PATTERN: '(\[publish\]|ci:publish|docker:push)'
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+
+    # ✅ Condition unique qui remplace le step "gate"
+    if: >
+      github.event_name == 'release' ||
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event_name == 'push' &&
+        github.ref == 'refs/heads/main' &&
+        (
+          contains(github.event.head_commit.message, '[publish]') ||
+          contains(github.event.head_commit.message, 'ci:publish') ||
+          contains(github.event.head_commit.message, 'docker:push') ||
+          contains(toJSON(github.event.commits), '[publish]') ||
+          contains(toJSON(github.event.commits), 'ci:publish') ||
+          contains(toJSON(github.event.commits), 'docker:push')
+        )
+      )
+
     steps:
       - uses: actions/checkout@v4
-
-      - name: Decide if we should push
-        id: gate
-        shell: bash
-        run: |
-          should=false
-          if [[ "${{ github.event_name }}" == "release" && "${{ github.event.action }}" == "published" ]]; then
-            should=true
-          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            should=true
-          elif [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
-            msg="${{ github.event.head_commit.message }}"
-            if echo "$msg" | grep -Eiq "${{ env.PUBLISH_COMMIT_PATTERN }}"; then
-              should=true
-            fi
-          fi
-          echo "should=${should}" >> "$GITHUB_OUTPUT"
-
-      - name: Stop early if not publishing
-        if: ${{ steps.gate.outputs.should != 'true' }}
-        run: echo "Skipping publish." && exit 0
-
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
-      # === NEW: probe Docker Hub secrets safely ===
+      # --- Logins ---
+      - name: GHCR login
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # optionnel: Docker Hub (ne s'exécute que si secrets fournis)
       - name: Probe Docker Hub secrets
         id: probe_dh
         env:
@@ -69,25 +74,16 @@ jobs:
             echo "has=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # GHCR login (toujours)
-      - name: GHCR login
-        if: ${{ steps.gate.outputs.should == 'true' }}
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Docker Hub login (seulement si secrets présents)
       - name: DockerHub login
-        if: ${{ steps.gate.outputs.should == 'true' && steps.probe_dh.outputs.has == 'true' }}
+        if: ${{ steps.probe_dh.outputs.has == 'true' }}
         uses: docker/login-action@v3
         with:
           registry: docker.io
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Compute extra tags
+      # --- Tags à publier ---
+      - name: Compute tags
         id: tags
         shell: bash
         run: |
@@ -100,16 +96,10 @@ jobs:
           latest="false"
           if [[ "${{ github.event_name }}" == "release" ]]; then latest="true"; fi
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.latest }}" == "true" ]]; then latest="true"; fi
-          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
-            msg="${{ github.event.head_commit.message }}"
-            if echo "$msg" | grep -Eiq "${{ env.PUBLISH_COMMIT_PATTERN }}"; then
-              latest="true"
-            fi
-          fi
           echo "rel_tag=${rel_tag}" >> "$GITHUB_OUTPUT"
           echo "latest=${latest}" >> "$GITHUB_OUTPUT"
 
-      # Meta GHCR (toujours)
+      # --- GHCR ---
       - name: Metadata (GHCR)
         id: meta_ghcr
         uses: docker/metadata-action@v5
@@ -121,7 +111,6 @@ jobs:
             type=raw,value=latest,enable=${{ steps.tags.outputs.latest == 'true' }}
 
       - name: Build & Push (GHCR)
-        if: ${{ steps.gate.outputs.should == 'true' }}
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -135,9 +124,9 @@ jobs:
           build-args: |
             REPO=${{ github.repository }}
 
-      # Meta Docker Hub (optionnel si secrets OK)
+      # --- Docker Hub (optionnel) ---
       - name: Metadata (Docker Hub)
-        if: ${{ steps.gate.outputs.should == 'true' && steps.probe_dh.outputs.has == 'true' }}
+        if: ${{ steps.probe_dh.outputs.has == 'true' }}
         id: meta_dh
         uses: docker/metadata-action@v5
         with:
@@ -148,7 +137,7 @@ jobs:
             type=raw,value=latest,enable=${{ steps.tags.outputs.latest == 'true' }}
 
       - name: Build & Push (Docker Hub)
-        if: ${{ steps.gate.outputs.should == 'true' && steps.probe_dh.outputs.has == 'true' }}
+        if: ${{ steps.probe_dh.outputs.has == 'true' }}
         uses: docker/build-push-action@v6
         with:
           context: .
