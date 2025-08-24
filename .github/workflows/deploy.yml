@@ -1,0 +1,167 @@
+# .github/workflows/verify-and-deploy-koyeb.yml
+name: Verify image & Deploy to Koyeb
+
+on:
+  # Run automatically after "Publish Docker image" workflow succeeds
+  workflow_run:
+    workflows: [ "Publish Docker image" ]
+    types: [ completed ]
+
+  # Allow manual runs too
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to deploy (default: latest)"
+        required: false
+        default: "latest"
+      registry:
+        description: "Which registry to deploy from: ghcr or dockerhub"
+        required: false
+        default: "ghcr"
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  IMAGE_NAME: ovh-dedicated-cli
+  # Default deploy tag; can be overridden by workflow_dispatch input
+  DEPLOY_TAG: latest
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  verify-and-deploy:
+    # Only run if the upstream workflow_run concluded successfully OR manual dispatch
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (not strictly required, but handy for metadata)
+        uses: actions/checkout@v4
+
+      - name: Normalize deploy tag / registry
+        id: cfg
+        shell: bash
+        run: |
+          tag="${{ inputs.tag }}"
+          reg="${{ inputs.registry }}"
+          # For workflow_run, inputs.* are empty; keep default latest and ghcr
+          if [[ -n "$tag" ]]; then
+            echo "DEPLOY_TAG=$tag" >> "$GITHUB_ENV"
+          fi
+          # Normalize registry selector
+          case "$reg" in
+            ghcr|"")  echo "REGISTRY=ghcr"   >> "$GITHUB_ENV" ;;
+            dockerhub) echo "REGISTRY=dockerhub" >> "$GITHUB_ENV" ;;
+            *) echo "Unsupported registry: $reg" >&2; exit 1 ;;
+          esac
+
+      - name: Set up Buildx (for imagetools inspect)
+        uses: docker/setup-buildx-action@v3
+
+      # ---- Logins (read-only is enough for inspect) ----
+      - name: Login GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Probe Docker Hub secrets
+        id: probe_dh
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        shell: bash
+        run: |
+          if [[ -n "$DH_USER" && -n "$DH_TOKEN" ]]; then
+            echo "has=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Login Docker Hub (if secrets present)
+        if: ${{ steps.probe_dh.outputs.has == 'true' }}
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # ---- Verify images availability ----
+      - name: Verify GHCR image availability
+        shell: bash
+        env:
+          REF: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ env.DEPLOY_TAG }}
+        run: |
+          set -euo pipefail
+          for i in {1..20}; do
+            if docker buildx imagetools inspect "$REF" >/dev/null 2>&1; then
+              echo "OK: $REF is available"
+              exit 0
+            fi
+            echo "Waiting GHCR propagation... ($i/20)"
+            sleep 5
+          done
+          echo "ERROR: $REF not available after retries" >&2
+          exit 1
+
+      - name: Verify Docker Hub image availability (best-effort)
+        if: ${{ steps.probe_dh.outputs.has == 'true' }}
+        shell: bash
+        env:
+          REF: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ env.DEPLOY_TAG }}
+        run: |
+          set -euo pipefail
+          for i in {1..20}; do
+            if docker buildx imagetools inspect "$REF" >/dev/null 2>&1; then
+              echo "OK: $REF is available"
+              exit 0
+            fi
+            echo "Waiting Docker Hub propagation... ($i/20)"
+            sleep 5
+          done
+          echo "ERROR: $REF not available after retries" >&2
+          exit 1
+
+      # ---- Pick the image to deploy (defaults to GHCR unless user selected dockerhub) ----
+      - name: Decide image reference to deploy
+        id: pick
+        shell: bash
+        run: |
+          if [[ "${{ env.REGISTRY }}" == "dockerhub" ]]; then
+            if [[ "${{ steps.probe_dh.outputs.has }}" != "true" ]]; then
+              echo "Docker Hub selected but secrets are missing; abort." >&2
+              exit 1
+            fi
+            echo 'IMAGE_REF=docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ env.DEPLOY_TAG }}' >> "$GITHUB_OUTPUT"
+          else
+            echo 'IMAGE_REF=ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ env.DEPLOY_TAG }}' >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---- Koyeb deploy (CLI) ----
+      - name: Install and configure Koyeb CLI
+        uses: koyeb-community/koyeb-actions@v2
+        with:
+          api_token: ${{ secrets.KOYEB_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Deploy to Koyeb (service update to new image)
+        env:
+          KOYEB_APP: ${{ vars.KOYEB_APP }}
+          KOYEB_SERVICE: ${{ vars.KOYEB_SERVICE }}
+          KOYEB_IMAGE_REF: ${{ steps.pick.outputs.IMAGE_REF }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${KOYEB_APP:?KOYEB_APP (Repo variable) is required}"
+          : "${KOYEB_SERVICE:?KOYEB_SERVICE (Repo variable) is required}"
+          : "${KOYEB_IMAGE_REF:?missing image ref}"
+          echo "Updating Koyeb service $KOYEB_APP/$KOYEB_SERVICE to image: $KOYEB_IMAGE_REF"
+          koyeb service update "$KOYEB_APP/$KOYEB_SERVICE" --docker "$KOYEB_IMAGE_REF" --output json | jq -r '.id? // "ok"'
