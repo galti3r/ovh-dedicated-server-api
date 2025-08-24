@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 import requests
 from flask import Flask, jsonify, request, Response, abort
-from werkzeug.exceptions import HTTPException  # <-- important: let 4xx bubble
+from werkzeug.exceptions import HTTPException  # let 4xx bubble
 
 # ---- .env auto-loading (no override of existing env) ----
 try:
@@ -319,42 +319,100 @@ def cli_main(argv: list[str] | None = None) -> int:
 app = Flask(__name__)
 
 
+def _get_json_body() -> dict[str, t.Any]:
+    """Safely get JSON body as dict, or empty dict."""
+    try:
+        obj = request.get_json(silent=True)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _get_first(mapping: dict[str, t.Any], keys: list[str]) -> str | None:
+    for k in keys:
+        if k in mapping and mapping[k] not in (None, ""):
+            return str(mapping[k])
+    return None
+
+
+def get_param(name: str, *aliases: str, default: str | None = None) -> str | None:
+    """
+    Resolve a parameter from: query args > JSON body > form > headers > default.
+    Names are case-sensitive for body/form keys, case-insensitive for headers.
+    """
+    keys = [name, *aliases]
+
+    # Query string
+    val = _get_first(request.args, keys)
+    if val:
+        return val
+
+    # JSON body
+    body = _get_json_body()
+    val = _get_first(body, keys)
+    if val:
+        return val
+
+    # Form (application/x-www-form-urlencoded or multipart)
+    val = _get_first(request.form, keys)
+    if val:
+        return val
+
+    # Headers (case-insensitive)
+    # Try exact keys, then "X-<Key>" header variants
+    for k in keys:
+        if k in request.headers:
+            v = request.headers.get(k)
+            if v not in (None, ""):
+                return v
+        xk = f"X-{k}".replace("_", "-")
+        if xk in request.headers:
+            v = request.headers.get(xk)
+            if v not in (None, ""):
+                return v
+
+    return default
+
+
 def client_from_request_fallback(
     default_app_key: str | None = None,
     default_app_secret: str | None = None,
     default_consumer_key: str | None = None,
 ) -> OvhClient:
-    # 1) Explicit credentials in query
-    q_app_key = request.args.get("appKey")
-    q_app_secret = request.args.get("appSecret")
-    q_consumer_key = request.args.get("consumerKey")
+    """
+    Credentials resolution:
+    1) Explicit AK/AS/CK from request (query/body/form/headers)
+    2) API key gate using WEB_API_KEY (apikey param)
+    3) Env/.env (possibly seeded by CLI defaults)
+    """
+    # 1) Explicit credentials
+    q_app_key = get_param("appKey", "applicationKey", "AK", "OVH_APPLICATION_KEY", "App-Key", "Application-Key")
+    q_app_secret = get_param("appSecret", "applicationSecret", "AS", "OVH_APPLICATION_SECRET", "App-Secret", "Application-Secret")
+    q_consumer_key = get_param("consumerKey", "CK", "OVH_CONSUMER_KEY", "Consumer-Key")
+
     if q_app_key and q_app_secret:
         return build_client_from_sources(q_app_key, q_app_secret, q_consumer_key, prefer_env=False)
 
-    # 2) apikey gate using env creds
-    apikey = request.args.get("apikey")
+    # 2) apikey gate
+    apikey = get_param("apikey", "apiKey", "Api-Key")
     if WEB_API_KEY:
         if not apikey or apikey != WEB_API_KEY:
             abort(Response("Forbidden (invalid or missing apikey)", 403))
     else:
+        # If apikey provided while WEB_API_KEY is disabled, forbid to avoid confusion
         if apikey:
             abort(Response("Forbidden (apikey mode disabled by server)", 403))
 
-    # 3) Use env/.env creds
+    # 3) Env/.env
     return build_client_from_sources(default_app_key, default_app_secret, default_consumer_key, prefer_env=True)
 
 
-@app.get("/healthz")
-def healthz() -> Response:
-    return Response("ok\n", 200, mimetype="text/plain")
-
-
-@app.get("/api")
-def api_handler():
-    output_format = (request.args.get("output-format") or DEFAULT_OUTPUT_FORMAT).lower()
-    command = request.args.get("command")
-    server_name = request.args.get("serverName") or DEFAULT_SERVER_NAME
-    field = request.args.get("field")
+def _handle_api_request():
+    # Accept params from query/body/form/headers
+    output_format = (get_param("output-format", "outputFormat", "format", "Output-Format") or DEFAULT_OUTPUT_FORMAT).lower()
+    command = get_param("command", "cmd", "Command")
+    server_name = get_param("serverName", "serviceName", "server", "Server-Name", "Service-Name") or DEFAULT_SERVER_NAME
+    field = get_param("field", "path", "Field")
 
     if not command:
         return jsonify({"error": "Missing 'command' parameter"}), 400
@@ -402,6 +460,17 @@ def api_handler():
         return jsonify({"error": str(e)}), 500
 
 
+@app.get("/healthz")
+def healthz() -> Response:
+    return Response("ok\n", 200, mimetype="text/plain")
+
+
+# Accept both GET and POST for /api
+@app.route("/api", methods=["GET", "POST"])
+def api_handler():
+    return _handle_api_request()
+
+
 def run_web_server(
     default_app_key: str | None = None,
     default_app_secret: str | None = None,
@@ -421,4 +490,3 @@ def run_web_server(
 # ---------- Entrypoint ----------
 if __name__ == "__main__":
     sys.exit(cli_main(sys.argv[1:]))
-
