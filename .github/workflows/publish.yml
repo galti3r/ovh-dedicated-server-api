@@ -63,17 +63,17 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Logins (Docker Hub optionnel; GHCR via GITHUB_TOKEN)
       - name: DockerHub login
-        if: steps.gate.outputs.should == 'true' && secrets.DOCKERHUB_USERNAME && secrets.DOCKERHUB_TOKEN
+        if: ${{ steps.gate.outputs.should == 'true' && secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
         uses: docker/login-action@v3
         with:
           registry: docker.io
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # Et pour être cohérent, ajoute aussi les ${ { } } au step GHCR :
       - name: GHCR login
-        if: steps.gate.outputs.should == 'true'
+        if: ${{ steps.gate.outputs.should == 'true' }}
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
