@@ -44,3 +44,4 @@ curl -s -X POST -H "X-Ovh-Application: ${AK}" -H "Content-Type: application/json
     ]
   }'
 # Open "validationUrl" from the output and validate to activate the CK.
+
