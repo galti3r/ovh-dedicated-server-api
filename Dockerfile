@@ -7,7 +7,9 @@ FROM python:3.12-slim AS builder
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PIP_ROOT_USER_ACTION=ignore
+
 
 WORKDIR /app
 
@@ -16,14 +18,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+
+
 # Copy only dependency file first (better layer caching)
 COPY requirements.txt /app/requirements.txt
 
 # Install deps into a custom prefix to copy later
 RUN python -m pip install --upgrade pip && \
-    python -m pip install --no-cache-dir --prefix=/install \
-      -r /app/requirements.txt \
-      gunicorn>=22,<23
+    python -m pip install --no-cache-dir --prefix=/install -r /app/requirements.txt
 
 ############################
 # Final image
