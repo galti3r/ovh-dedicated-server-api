@@ -1,0 +1,137 @@
+name: Publish Docker image
+
+on:
+  release:
+    types: [published]
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v1.2.3). Leave empty to publish latest+sha only."
+        required: false
+        default: ""
+      latest:
+        description: "Also tag as 'latest'"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ovh-dedicated-cli
+  # Motifs qui déclenchent un push si présents dans le commit message sur main
+  PUBLISH_COMMIT_PATTERN: '(\[publish\]|ci:publish|docker:push)'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Decide if we should push
+        id: gate
+        shell: bash
+        run: |
+          should=false
+          if [[ "${{ github.event_name }}" == "release" && "${{ github.event.action }}" == "published" ]]; then
+            should=true
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            should=true
+          elif [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
+            msg="${{ github.event.head_commit.message }}"
+            if echo "$msg" | grep -Eiq "${{ env.PUBLISH_COMMIT_PATTERN }}"; then
+              should=true
+            fi
+          fi
+          echo "should=${should}" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Stop early if not publishing
+        if: steps.gate.outputs.should != 'true'
+        run: |
+          echo "Skipping publish (no release/manual trigger and commit message did not match pattern)."
+          exit 0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Logins (Docker Hub optionnel; GHCR via GITHUB_TOKEN)
+      - name: DockerHub login
+        if: steps.gate.outputs.should == 'true' && secrets.DOCKERHUB_USERNAME && secrets.DOCKERHUB_TOKEN
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: GHCR login
+        if: steps.gate.outputs.should == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute extra tags for this event
+        id: tags
+        shell: bash
+        run: |
+          EXTRA_TAGS=""
+          if [[ "${{ github.event_name }}" == "release" && "${{ github.event.action }}" == "published" ]]; then
+            # Use the release tag name as-is (e.g. v1.2.3)
+            echo "rel_tag=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.tag }}" != "" ]]; then
+            echo "rel_tag=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          fi
+          # latest conditions: release OR manual with latest=true OR commit-trigger on main
+          latest="false"
+          if [[ "${{ github.event_name }}" == "release" ]]; then latest="true"; fi
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.latest }}" == "true" ]]; then latest="true"; fi
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
+            msg="${{ github.event.head_commit.message }}"
+            if echo "$msg" | grep -Eiq "${{ env.PUBLISH_COMMIT_PATTERN }}"; then
+              latest="true"
+            fi
+          fi
+          echo "latest=${latest}" >> $GITHUB_OUTPUT
+
+      - name: Extract metadata (both registries)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          # Base tags (short SHA always)
+          tags: |
+            type=sha,format=short
+            # Release tag (from release event) or manual input tag
+            type=raw,value=${{ steps.tags.outputs.rel_tag }},enable=${{ steps.tags.outputs.rel_tag != '' }}
+            # Latest if flagged
+            type=raw,value=latest,enable=${{ steps.tags.outputs.latest == 'true' }}
+          labels: |
+            org.opencontainers.image.title=${{ env.IMAGE_NAME }}
+            org.opencontainers.image.source=${{ github.repository }}
+
+      - name: Build and push (multi-arch)
+        if: steps.gate.outputs.should == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            REPO=${{ github.repository }}
